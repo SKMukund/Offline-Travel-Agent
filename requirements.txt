@@ -3,3 +3,5 @@ geopandas
 ollama
 geopy
 pandas
+scipy
+folium
