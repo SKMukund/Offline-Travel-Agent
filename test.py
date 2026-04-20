@@ -122,7 +122,7 @@ check(f"to_km(1.0, miles) ≈ 1.609", abs(km - 1.60934) < 0.001)
 # STEP 4 — Map generation + clear
 # ─────────────────────────────────────────────────────────────
 section("4 / 5  Map — generate, fit-bounds, clear")
-map_path = generate_map(
+map_path, _ = generate_map(
     area="midtown",
     coords=(midtown_lat, midtown_lon),
     results=res_fd,

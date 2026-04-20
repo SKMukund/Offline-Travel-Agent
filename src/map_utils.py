@@ -35,9 +35,10 @@ _DEFAULT_COLOR = "blue"
 
 # ── module-level state ────────────────────────────────────────────────────────
 # Each entry: (area_name, (lat, lon), {category: DataFrame})
+# _accumulated_layers tracks history for optional replace_existing=False mode.
+# The map object itself is NOT stored here — it is returned to the caller so
+# that module reloads (e.g. %autoreload 2 in notebooks) cannot reset it.
 _accumulated_layers: list[tuple[str, tuple, dict]] = []
-# Reference kept so display_map_in_notebook() can use Folium's own repr
-_last_map: folium.Map | None = None
 
 
 # ── internal builder ──────────────────────────────────────────────────────────
@@ -169,22 +170,26 @@ def generate_map(
 
     Returns
     -------
-    str   absolute path of the saved HTML file
+    tuple[str, folium.Map]
+        (absolute path of saved HTML file, the Folium map object)
+        The map object is returned to the caller so it can be held in a
+        longer-lived scope (e.g. run_travel_agent's local variable) rather
+        than relying on module-level state that a module reload would reset.
     """
-    global _accumulated_layers, _last_map
+    global _accumulated_layers
 
     if replace_existing:
         _accumulated_layers = [(area, coords, results)]
     else:
         _accumulated_layers.append((area, coords, results))
 
-    _last_map = _build_map(_accumulated_layers, tile_url)
+    m = _build_map(_accumulated_layers, tile_url)
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    _last_map.save(str(out))
+    m.save(str(out))
     print(f"  [Map saved → {out.resolve()}]")
-    return str(out.resolve())
+    return str(out.resolve()), m
 
 
 def clear_map(output_path: str = "map_output/map.html") -> None:
@@ -194,45 +199,28 @@ def clear_map(output_path: str = "map_output/map.html") -> None:
     Called on agent exit so stale session markers are not visible if the
     map file is opened again after the program ends.
     """
-    global _accumulated_layers, _last_map
+    global _accumulated_layers
     _accumulated_layers = []
-    _last_map = _build_map([], None)
+    blank = _build_map([], None)
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    _last_map.save(str(out))
+    blank.save(str(out))
 
 
-def display_map_in_notebook(width: int = 900, height: int = 520) -> None:
+def display_map_in_notebook(m: folium.Map) -> None:
     """
-    Render the last generated map inline inside a Jupyter / IPython notebook.
+    Render a Folium map inline inside a Jupyter / IPython notebook.
 
-    Uses Folium's own _repr_html_() so the map is self-contained and
-    correctly sized inside the cell — no external file serving needed.
-    Safe to call even if IPython is unavailable (prints a fallback message).
-
-    Parameters
-    ----------
-    width, height : pixel dimensions of the embedded map cell
+    Takes the map object explicitly so the caller (agent.py) holds the
+    reference in its own scope — this survives module reloads (%autoreload).
+    Delegates to Folium's own display path so sizing and JS are correct.
+    Safe to call when IPython is unavailable (prints a fallback message).
     """
     try:
-        from IPython.display import HTML, display
+        from IPython.display import display
     except ImportError:
         print("IPython not available — open map_output/map.html in a browser.")
         return
 
-    if _last_map is None:
-        print("No map has been generated yet.")
-        return
-
-    # _repr_html_() returns a self-contained iframe srcdoc snippet that
-    # Folium uses internally for notebook display — reliable cross-environment.
-    html_snippet = _last_map._repr_html_()
-
-    # Wrap in a sized div so the map fills a predictable area in the cell
-    display(
-        HTML(
-            f'<div style="width:{width}px; height:{height}px;">'
-            f"{html_snippet}"
-            f"</div>"
-        )
-    )
+    # Folium's __repr_html__ renders a self-sizing iframe — most reliable path
+    display(m)

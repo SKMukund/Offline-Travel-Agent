@@ -7,10 +7,11 @@ import os
 import re
 import sys
 
+import folium
 import ollama
 
 try:
-    from IPython.display import clear_output
+    from IPython.display import clear_output as _ipy_clear
     _IN_NOTEBOOK = True
 except ImportError:
     _IN_NOTEBOOK = False
@@ -66,9 +67,9 @@ def _detect_radius(message: str) -> tuple[float | None, str | None]:
 
 
 def _print_history(conversation_history: list[dict]) -> None:
-    """Clear screen and reprint the full chat in Agent/User format."""
-    if _IN_NOTEBOOK:
-        clear_output(wait=True)
+    """Reprint the full chat in Agent/User format. Never clears output itself —
+    callers are responsible for clearing so display() calls after this function
+    don't accidentally consume a pending clear_output(wait=True)."""
     print("=" * 60)
     print("  Offline Travel Agent  (powered by llama3.2 via Ollama)")
     print("=" * 60 + "\n")
@@ -134,6 +135,8 @@ def run_travel_agent(
     current_unit = unit
     current_area: str | None = None
     current_coords: tuple | None = None
+    # Held here (not in map_utils) so module reloads cannot reset it
+    session_map: folium.Map | None = None
 
     # Build a human-readable city label from the optional location tuple
     if location:
@@ -159,6 +162,8 @@ def run_travel_agent(
             conversation_history.append(
                 {"role": "assistant", "content": "Goodbye! Safe travels!"}
             )
+            if _IN_NOTEBOOK:
+                _ipy_clear(wait=False)
             _print_history(conversation_history)
             clear_map()
             break
@@ -167,6 +172,8 @@ def run_travel_agent(
             conversation_history.append(
                 {"role": "assistant", "content": "Goodbye! Safe travels!"}
             )
+            if _IN_NOTEBOOK:
+                _ipy_clear(wait=False)
             _print_history(conversation_history)
             clear_map()
             break
@@ -221,7 +228,7 @@ def run_travel_agent(
             # Generate/update the map after every turn with real results
             _coords_for_map = coords if coords else current_coords
             if _coords_for_map:
-                _map_path = generate_map(area, _coords_for_map, results)
+                _, session_map = generate_map(area, _coords_for_map, results)
         elif area:
             detected_cats = detect_categories(user_input)
             if detected_cats:
@@ -239,9 +246,11 @@ def run_travel_agent(
         conversation_history.append({"role": "user", "content": injected_content})
         reply = ask_ollama(conversation_history)
         conversation_history.append({"role": "assistant", "content": reply})
+        if _IN_NOTEBOOK:
+            _ipy_clear(wait=False)
         _print_history(conversation_history)
-        if _IN_NOTEBOOK and _map_path:
-            display_map_in_notebook()
+        if _IN_NOTEBOOK and session_map is not None:
+            display_map_in_notebook(session_map)
 
 
 # ─────────────────────────────────────────
