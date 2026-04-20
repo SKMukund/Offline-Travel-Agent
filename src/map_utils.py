@@ -13,6 +13,8 @@ local tile server; all marker/bounds logic stays the same.
 
 from __future__ import annotations
 
+import re
+import urllib.request
 from pathlib import Path
 
 import folium
@@ -33,12 +35,60 @@ _CATEGORY_COLORS: dict[str, str] = {
 }
 _DEFAULT_COLOR = "blue"
 
+_MAX_MARKERS_PER_CATEGORY = 100
+
 # ── module-level state ────────────────────────────────────────────────────────
 # Each entry: (area_name, (lat, lon), {category: DataFrame})
-# _accumulated_layers tracks history for optional replace_existing=False mode.
 # The map object itself is NOT stored here — it is returned to the caller so
 # that module reloads (e.g. %autoreload 2 in notebooks) cannot reset it.
 _accumulated_layers: list[tuple[str, tuple, dict]] = []
+
+
+# ── CDN → local resource bundler ─────────────────────────────────────────────
+
+def _localize_resources(html_path: Path) -> None:
+    """
+    Download every CDN JS/CSS referenced in *html_path* into a sibling
+    static/ directory, then rewrite the HTML to use those local copies.
+
+    Only plain JS (<script src="...">) and CSS (<link ... href="...">) are
+    handled; font files referenced inside CSS are left as-is.  Files are
+    cached — repeated calls cost only a filesystem stat per URL.
+    """
+    static_dir = html_path.parent / "static"
+    static_dir.mkdir(exist_ok=True)
+
+    html = html_path.read_text(encoding="utf-8")
+
+    def _download(url: str) -> str | None:
+        filename = url.split("/")[-1].split("?")[0]
+        dest = static_dir / filename
+        if not dest.exists():
+            try:
+                urllib.request.urlretrieve(url, dest)
+            except Exception as exc:
+                print(f"  [Map] could not download {url}: {exc}")
+                return None
+        return f"static/{filename}"
+
+    def _replace_script(m: re.Match) -> str:
+        local = _download(m.group(1))
+        # Only replace the opening tag; the original </script> stays in place
+        return f'<script src="{local}">' if local else m.group(0)
+
+    def _replace_link(m: re.Match) -> str:
+        local = _download(m.group(1))
+        return f'<link rel="stylesheet" href="{local}"/>' if local else m.group(0)
+
+    # Match opening script tag only (closing </script> is left as-is)
+    html = re.sub(r'<script src="(https?://[^"]+)"[^>]*>', _replace_script, html)
+    html = re.sub(
+        r'<link rel="stylesheet" href="(https?://[^"]+)"[^>]*/?>',
+        _replace_link,
+        html,
+    )
+
+    html_path.write_text(html, encoding="utf-8")
 
 
 # ── internal builder ──────────────────────────────────────────────────────────
@@ -55,7 +105,6 @@ def _build_map(
     just centres on it at zoom 15.
     """
     if not layers:
-        # Blank world-view map — shown after the session is cleared
         return folium.Map(location=[20.0, 0.0], zoom_start=2)
 
     # ── collect all coordinates for bounds and centroid ──────────────
@@ -115,6 +164,12 @@ def _build_map(
             if df is None or df.empty:
                 continue
             color = _CATEGORY_COLORS.get(category, _DEFAULT_COLOR)
+            if len(df) > _MAX_MARKERS_PER_CATEGORY:
+                print(
+                    f"  [Map] {category}: showing {_MAX_MARKERS_PER_CATEGORY}"
+                    f" of {len(df)} results (closest first)"
+                )
+                df = df.head(_MAX_MARKERS_PER_CATEGORY)
             for _, row in df.iterrows():
                 name = row.get("name", "Unknown")
                 address = row.get("addr:street", "")
@@ -150,9 +205,9 @@ def generate_map(
     output_path: str = "map_output/map.html",
     tile_url: str | None = None,
     replace_existing: bool = True,
-) -> str:
+) -> tuple[str, folium.Map]:
     """
-    Build an interactive HTML map and save it to output_path.
+    Build an interactive HTML map, save it, and bundle CDN assets locally.
 
     Parameters
     ----------
@@ -165,16 +220,11 @@ def generate_map(
                        Leave None to use OpenStreetMap tiles (requires internet).
     replace_existing : True  — clear previous markers; show only this turn's results.
                        False — keep previous markers and append new ones.
-                       Future natural-language support ("keep the old spots too")
-                       should set this flag to False before calling.
 
     Returns
     -------
     tuple[str, folium.Map]
-        (absolute path of saved HTML file, the Folium map object)
-        The map object is returned to the caller so it can be held in a
-        longer-lived scope (e.g. run_travel_agent's local variable) rather
-        than relying on module-level state that a module reload would reset.
+        (file:// URI of saved HTML file, the Folium map object)
     """
     global _accumulated_layers
 
@@ -188,8 +238,12 @@ def generate_map(
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     m.save(str(out))
-    print(f"  [Map saved → {out.resolve()}]")
-    return str(out.resolve()), m
+
+    _localize_resources(out)
+
+    abs_path = out.resolve()
+    print(f"  [Map saved → {abs_path}]")
+    return abs_path.as_uri(), m
 
 
 def clear_map(output_path: str = "map_output/map.html") -> None:
@@ -207,20 +261,51 @@ def clear_map(output_path: str = "map_output/map.html") -> None:
     blank.save(str(out))
 
 
-def display_map_in_notebook(m: folium.Map) -> None:
+def display_map_in_notebook(m: folium.Map, path: str | None = None) -> None:
     """
     Render a Folium map inline inside a Jupyter / IPython notebook.
 
-    Takes the map object explicitly so the caller (agent.py) holds the
-    reference in its own scope — this survives module reloads (%autoreload).
-    Delegates to Folium's own display path so sizing and JS are correct.
-    Safe to call when IPython is unavailable (prints a fallback message).
+    VS Code's notebook CSP blocks Leaflet's CDN resources when the map is
+    embedded directly as HTML.  The workaround is to save the HTML file and
+    serve it from a local HTTP server, then display it in an IFrame pointing
+    to localhost — VS Code permits that origin.
+
+    Parameters
+    ----------
+    m    : the Folium map object (used only when path is None and the file
+           needs to be (re)saved to the default location)
+    path : file:// URI or absolute path returned by generate_map.
+           When None, saves to map_output/map.html.
     """
     try:
-        from IPython.display import display
+        from IPython.display import IFrame, display
     except ImportError:
-        print("IPython not available — open map_output/map.html in a browser.")
+        print("IPython not available — open the map HTML in a browser.")
         return
 
-    # Folium's __repr_html__ renders a self-sizing iframe — most reliable path
-    display(m)
+    import functools
+    import http.server
+    import socket
+    import threading
+
+    if path is None:
+        out = Path("map_output/map.html").resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        m.save(str(out))
+        _localize_resources(out)
+    else:
+        out = Path(path.removeprefix("file://")).resolve()
+
+    # Spin up a local HTTP server so the browser can load static/ assets too
+    with socket.socket() as s:
+        s.bind(("", 0))
+        port = s.getsockname()[1]
+
+    handler = functools.partial(
+        http.server.SimpleHTTPRequestHandler,
+        directory=str(out.parent),
+    )
+    server = http.server.HTTPServer(("localhost", port), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    display(IFrame(f"http://localhost:{port}/{out.name}", width="100%", height=500))
