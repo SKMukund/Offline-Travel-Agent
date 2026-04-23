@@ -11,10 +11,16 @@ import folium
 import ollama
 
 try:
+    from IPython import get_ipython
     from IPython.display import clear_output as _ipy_clear
-    _IN_NOTEBOOK = True
+    # True only when running inside an actual Jupyter kernel (ZMQInteractiveShell),
+    # not in a plain terminal where IPython is installed but get_ipython() is None
+    # or returns a TerminalInteractiveShell.
+    _shell = get_ipython()
+    _IN_NOTEBOOK = _shell is not None and _shell.__class__.__name__ == "ZMQInteractiveShell"
 except ImportError:
     _IN_NOTEBOOK = False
+    def _ipy_clear(_wait=False): pass
 
 # Ensure src/ is on the path so this module works whether imported from the
 # project root (e.g. a notebook) or run directly from within src/.
@@ -22,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cache import SpatialCache
 from filter import detect_categories, filter_data, filter_nearby, to_km
-from map_utils import clear_map, display_map_in_notebook, generate_map
+from map_utils import clear_map, display_map_in_notebook, generate_map, open_map_in_browser
 
 MODEL = "llama3.2"
 
@@ -71,7 +77,7 @@ def _print_history(conversation_history: list[dict]) -> None:
     callers are responsible for clearing so display() calls after this function
     don't accidentally consume a pending clear_output(wait=True)."""
     print("=" * 60)
-    print("  Offline Travel Agent  (powered by llama3.2 via Ollama)")
+    print("  Offline Travel Agent  (powered by llama3.2 via Ollama) v2")
     print("=" * 60 + "\n")
     for msg in conversation_history:
         if msg["role"] == "system":
@@ -129,14 +135,18 @@ def run_travel_agent(
     # ── one-time setup ──────────────────────────────────────────────
     cache = SpatialCache(data)
 
+    # Clear any stale markers from a previous session
+    clear_map()
+
     conversation_history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     current_radius = radius
     current_unit = unit
     current_area: str | None = None
     current_coords: tuple | None = None
-    # Held here (not in map_utils) so module reloads cannot reset it
     session_map: folium.Map | None = None
+    session_map_path: str | None = None   # file:// URI of the last saved map
+    _browser_opened = False               # open browser only after first real results
 
     # Build a human-readable city label from the optional location tuple
     if location:
@@ -155,102 +165,104 @@ def run_travel_agent(
     _print_history(conversation_history)
 
     # ── conversation loop ───────────────────────────────────────────
-    while True:
-        try:
-            user_input = input("You: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            conversation_history.append(
-                {"role": "assistant", "content": "Goodbye! Safe travels!"}
-            )
-            if _IN_NOTEBOOK:
-                _ipy_clear(wait=False)
-            _print_history(conversation_history)
-            clear_map()
-            break
-
-        if user_input.lower() in ("quit", "exit", "q"):
-            conversation_history.append(
-                {"role": "assistant", "content": "Goodbye! Safe travels!"}
-            )
-            if _IN_NOTEBOOK:
-                _ipy_clear(wait=False)
-            _print_history(conversation_history)
-            clear_map()
-            break
-
-        if not user_input:
-            continue
-
-        _map_path: str | None = None
-
-        # ── radius update from natural language ─────────────────────
-        new_radius, new_unit = _detect_radius(user_input)
-        if new_radius is not None:
-            current_radius = new_radius
-            current_unit = new_unit
-            print(f"  [Search radius updated to {current_radius} {current_unit}]")
-
-        # ── area + category detection and cache query ────────────────
-        area, coords, results = filter_data(
-            user_input, cache, current_radius, current_unit
-        )
-
-        # Persist area/coords so the user doesn't repeat their location
-        if area:
-            current_area = area
-            current_coords = coords
-        elif current_area and current_coords:
-            # Area not in this message — fall back to stored location and
-            # query newly mentioned categories through the cache.
-            categories = detect_categories(user_input)
-            if categories:
-                area = current_area
-                radius_km = to_km(current_radius, current_unit)
-                results = filter_nearby(
-                    cache, current_coords, radius_km, categories
+    try:
+        while True:
+            try:
+                user_input = input("You: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                conversation_history.append(
+                    {"role": "assistant", "content": "Goodbye! Safe travels!"}
                 )
-                results = {cat: df.head(20) for cat, df in results.items() if not df.empty}
+                if _IN_NOTEBOOK:
+                    _ipy_clear(wait=False)
+                _print_history(conversation_history)
+                break
 
-        # ── build injected content for conversation history ──────────
-        if area and results:
-            total = sum(len(df) for df in results.values())
-            cats_found = list(results.keys())
-            print(
-                f"  [Area: {area.title()} | "
-                f"{total} result(s) in: {', '.join(cats_found)}]"
+            if user_input.lower() in ("quit", "exit", "q"):
+                conversation_history.append(
+                    {"role": "assistant", "content": "Goodbye! Safe travels!"}
+                )
+                if _IN_NOTEBOOK:
+                    _ipy_clear(wait=False)
+                _print_history(conversation_history)
+                break
+
+            if not user_input:
+                continue
+
+            _map_path: str | None = None
+
+            # ── radius update from natural language ─────────────────
+            new_radius, new_unit = _detect_radius(user_input)
+            if new_radius is not None:
+                current_radius = new_radius
+                current_unit = new_unit
+                print(f"  [Search radius updated to {current_radius} {current_unit}]")
+
+            # ── area + category detection and cache query ────────────
+            area, coords, results = filter_data(
+                user_input, cache, current_radius, current_unit
             )
-            context_block = _results_to_context(area, results)
-            injected_content = (
-                f"{user_input}\n\n"
-                f"[LOCAL DATA — recommend ONLY from the list below]\n"
-                f"{context_block}"
-            )
-            # Generate/update the map after every turn with real results
-            _coords_for_map = coords if coords else current_coords
-            if _coords_for_map:
-                _, session_map = generate_map(area, _coords_for_map, results)
-        elif area:
-            detected_cats = detect_categories(user_input)
-            if detected_cats:
+
+            # Persist area/coords so the user doesn't repeat their location
+            if area:
+                current_area = area
+                current_coords = coords
+            elif current_area and current_coords:
+                categories = detect_categories(user_input)
+                if categories:
+                    area = current_area
+                    radius_km = to_km(current_radius, current_unit)
+                    results = filter_nearby(
+                        cache, current_coords, radius_km, categories
+                    )
+                    results = {cat: df.head(20) for cat, df in results.items() if not df.empty}
+
+            # ── build injected content for conversation history ──────
+            if area and results:
+                total = sum(len(df) for df in results.values())
+                cats_found = list(results.keys())
                 print(
                     f"  [Area: {area.title()} | "
-                    f"No data available for: {', '.join(detected_cats)}]"
+                    f"{total} result(s) in: {', '.join(cats_found)}]"
                 )
+                context_block = _results_to_context(area, results)
+                injected_content = (
+                    f"{user_input}\n\n"
+                    f"[LOCAL DATA — recommend ONLY from the list below]\n"
+                    f"{context_block}"
+                )
+                _coords_for_map = coords if coords else current_coords
+                if _coords_for_map:
+                    _map_path, session_map = generate_map(area, _coords_for_map, results)
+                    session_map_path = _map_path
+                    if not _IN_NOTEBOOK and not _browser_opened:
+                        open_map_in_browser(_map_path)
+                        _browser_opened = True
+            elif area:
+                detected_cats = detect_categories(user_input)
+                if detected_cats:
+                    print(
+                        f"  [Area: {area.title()} | "
+                        f"No data available for: {', '.join(detected_cats)}]"
+                    )
+                else:
+                    print(f"  [Area: {area.title()} | No category detected — asking follow-up]")
+                injected_content = user_input
             else:
-                print(f"  [Area: {area.title()} | No category detected — asking follow-up]")
-            injected_content = user_input
-        else:
-            injected_content = user_input
+                injected_content = user_input
 
-        # ── call Ollama and append reply ─────────────────────────────
-        conversation_history.append({"role": "user", "content": injected_content})
-        reply = ask_ollama(conversation_history)
-        conversation_history.append({"role": "assistant", "content": reply})
-        if _IN_NOTEBOOK:
-            _ipy_clear(wait=False)
-        _print_history(conversation_history)
-        if _IN_NOTEBOOK and session_map is not None:
-            display_map_in_notebook(session_map)
+            # ── call Ollama and append reply ─────────────────────────
+            conversation_history.append({"role": "user", "content": injected_content})
+            reply = ask_ollama(conversation_history)
+            conversation_history.append({"role": "assistant", "content": reply})
+            if _IN_NOTEBOOK:
+                _ipy_clear(wait=False)
+            _print_history(conversation_history)
+            if _IN_NOTEBOOK and session_map is not None:
+                display_map_in_notebook(session_map, session_map_path)
+    finally:
+        clear_map()
 
 
 # ─────────────────────────────────────────

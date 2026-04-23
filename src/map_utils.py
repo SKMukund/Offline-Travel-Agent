@@ -13,9 +13,15 @@ local tile server; all marker/bounds logic stays the same.
 
 from __future__ import annotations
 
+import functools
+import http.server
 import re
+import socket
+import threading
+import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import urljoin
 
 import folium
 
@@ -38,57 +44,178 @@ _DEFAULT_COLOR = "blue"
 _MAX_MARKERS_PER_CATEGORY = 100
 
 # ── module-level state ────────────────────────────────────────────────────────
-# Each entry: (area_name, (lat, lon), {category: DataFrame})
-# The map object itself is NOT stored here — it is returned to the caller so
-# that module reloads (e.g. %autoreload 2 in notebooks) cannot reset it.
 _accumulated_layers: list[tuple[str, tuple, dict]] = []
+
+# Persistent HTTP server shared by display_map_in_notebook and open_map_in_browser
+_server: http.server.HTTPServer | None = None
+_server_port: int = 0
+
+
+# ── silent HTTP handler ───────────────────────────────────────────────────────
+
+class _SilentHandler(http.server.SimpleHTTPRequestHandler):
+    """SimpleHTTPRequestHandler with all request logging suppressed.
+
+    Without this, every 2-second version.txt poll produces a log line on
+    stderr, flooding the terminal and Jupyter cell output.
+    """
+    def log_message(self, *_):
+        pass
+
+
+# ── local HTTP server ─────────────────────────────────────────────────────────
+
+def _ensure_server(serve_dir: str) -> int:
+    """Start the shared map HTTP server if not already running; return its port."""
+    global _server, _server_port
+    if _server is not None:
+        return _server_port
+    with socket.socket() as s:
+        s.bind(("", 0))
+        _server_port = s.getsockname()[1]
+    handler = functools.partial(_SilentHandler, directory=serve_dir)
+    _server = http.server.HTTPServer(("localhost", _server_port), handler)
+    threading.Thread(target=_server.serve_forever, daemon=True).start()
+    return _server_port
 
 
 # ── CDN → local resource bundler ─────────────────────────────────────────────
+
+# Only image extensions are downloaded from CSS url() references.
+# Font files (.woff2/.ttf/etc.) are intentionally skipped — the map renders
+# correctly without them; icon glyphs inside markers just fall back to text.
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico"}
+
+
+def _download_css_assets(css_path: Path, css_cdn_url: str, serve_root: Path) -> None:
+    """
+    Scan a downloaded CSS file for url() references that point to image files
+    and download them to the path the local HTTP server will serve them from.
+
+    Example: leaflet.awesome-markers.css contains
+        url('images/markers-soft.png')
+    The CSS is served at /static/leaflet.awesome-markers.css, so the browser
+    resolves that to /static/images/markers-soft.png.  We therefore download
+    the image from the CDN and store it at serve_root/static/images/markers-soft.png.
+    """
+    try:
+        css_text = css_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+
+    refs = re.findall(r'url\(["\']?([^)"\'?\s#][^)"\'?#\s]*)["\']?\)', css_text)
+
+    for ref in refs:
+        ref = ref.strip()
+        if ref.startswith(("data:", "http://", "https://", "#")):
+            continue
+        ext = Path(ref.split("?")[0]).suffix.lower()
+        if ext not in _IMAGE_EXTS:
+            continue
+
+        # Absolute CDN URL for this asset
+        abs_url = urljoin(css_cdn_url, ref)
+
+        # Compute where the browser will look for this file.
+        # CSS is always saved to serve_root/static/<filename>.
+        # Resolve the reference relative to "static/" using simple .. normalisation.
+        css_serve_dir = "static"
+        raw_parts = f"{css_serve_dir}/{ref}".split("/")
+        normalised: list[str] = []
+        for part in raw_parts:
+            if part == "..":
+                if normalised:
+                    normalised.pop()
+            elif part and part != ".":
+                normalised.append(part)
+
+        local_path = serve_root.joinpath(*normalised)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not local_path.exists():
+            try:
+                urllib.request.urlretrieve(abs_url, local_path)
+            except Exception:
+                pass  # best-effort; missing images degrade gracefully
+
 
 def _localize_resources(html_path: Path) -> None:
     """
     Download every CDN JS/CSS referenced in *html_path* into a sibling
     static/ directory, then rewrite the HTML to use those local copies.
+    Also downloads image assets referenced inside the CSS files so that
+    marker sprites render correctly without an internet connection.
 
-    Only plain JS (<script src="...">) and CSS (<link ... href="...">) are
-    handled; font files referenced inside CSS are left as-is.  Files are
-    cached — repeated calls cost only a filesystem stat per URL.
+    Files are cached — repeated calls cost only a filesystem stat per URL.
     """
     static_dir = html_path.parent / "static"
     static_dir.mkdir(exist_ok=True)
 
     html = html_path.read_text(encoding="utf-8")
 
-    def _download(url: str) -> str | None:
-        filename = url.split("/")[-1].split("?")[0]
+    # Track original CDN URL alongside local path for CSS asset scanning
+    downloaded_css: list[tuple[Path, str]] = []
+
+    def _download(cdn_url: str) -> str | None:
+        filename = cdn_url.split("/")[-1].split("?")[0]
         dest = static_dir / filename
         if not dest.exists():
             try:
-                urllib.request.urlretrieve(url, dest)
+                urllib.request.urlretrieve(cdn_url, dest)
             except Exception as exc:
-                print(f"  [Map] could not download {url}: {exc}")
+                print(f"  [Map] could not download {cdn_url}: {exc}")
                 return None
+        if dest.suffix.lower() == ".css":
+            downloaded_css.append((dest, cdn_url))
         return f"static/{filename}"
 
     def _replace_script(m: re.Match) -> str:
         local = _download(m.group(1))
-        # Only replace the opening tag; the original </script> stays in place
+        # Only replace opening tag; original </script> stays in place
         return f'<script src="{local}">' if local else m.group(0)
 
     def _replace_link(m: re.Match) -> str:
         local = _download(m.group(1))
         return f'<link rel="stylesheet" href="{local}"/>' if local else m.group(0)
 
-    # Match opening script tag only (closing </script> is left as-is)
     html = re.sub(r'<script src="(https?://[^"]+)"[^>]*>', _replace_script, html)
     html = re.sub(
         r'<link rel="stylesheet" href="(https?://[^"]+)"[^>]*/?>',
         _replace_link,
         html,
     )
-
     html_path.write_text(html, encoding="utf-8")
+
+    # Download image assets referenced inside each CSS file
+    for css_path, css_cdn_url in downloaded_css:
+        _download_css_assets(css_path, css_cdn_url, html_path.parent)
+
+
+# ── live-reload helpers ───────────────────────────────────────────────────────
+
+# Polls version.txt every 2 s; reloads when the content changes.
+_LIVE_RELOAD_JS = (
+    "<script>"
+    "(function(){"
+    "var v=null;"
+    "setInterval(function(){"
+    "fetch('version.txt?t='+Date.now(),{cache:'no-store'})"
+    ".then(function(r){return r.text();})"
+    ".then(function(n){if(v===null){v=n;return;}if(n!==v){location.reload();}})"
+    ".catch(function(){});"
+    "},2000);"
+    "})();"
+    "</script>"
+)
+
+
+def _inject_live_reload(html_path: Path) -> None:
+    """Inject the live-reload polling snippet and bump version.txt."""
+    html = html_path.read_text(encoding="utf-8")
+    if _LIVE_RELOAD_JS not in html:
+        html = html.replace("</body>", _LIVE_RELOAD_JS + "\n</body>", 1)
+        html_path.write_text(html, encoding="utf-8")
+    (html_path.parent / "version.txt").write_text(str(time.time()), encoding="utf-8")
 
 
 # ── internal builder ──────────────────────────────────────────────────────────
@@ -97,17 +224,10 @@ def _build_map(
     layers: list[tuple[str, tuple, dict]],
     tile_url: str | None,
 ) -> folium.Map:
-    """
-    Render a Folium map from a list of (area, origin_coords, results) layers.
-
-    The map is automatically fit-bounded to all markers so only the relevant
-    region is shown in the initial view. If there is only one point the map
-    just centres on it at zoom 15.
-    """
+    """Build a Folium map from accumulated layers, fit-bounded to all markers."""
     if not layers:
         return folium.Map(location=[20.0, 0.0], zoom_start=2)
 
-    # ── collect all coordinates for bounds and centroid ──────────────
     all_lats: list[float] = []
     all_lons: list[float] = []
     for _, (lat, lon), results in layers:
@@ -135,9 +255,9 @@ def _build_map(
             tiles="OpenStreetMap",
         )
 
-    # Fit view to all markers so only the needed region is visible
+    # Fit view tightly to markers so only the relevant city area is loaded
     if len(all_lats) > 1:
-        pad = 0.003  # ~300 m padding around the bounding box
+        pad = 0.003  # ~300 m padding
         m.fit_bounds(
             [
                 [min(all_lats) - pad, min(all_lons) - pad],
@@ -145,7 +265,6 @@ def _build_map(
             ]
         )
 
-    # ── render markers ────────────────────────────────────────────────
     seen_origins: set[tuple] = set()
     for area, (lat, lon), results in layers:
         origin_key = (round(lat, 5), round(lon, 5))
@@ -207,24 +326,11 @@ def generate_map(
     replace_existing: bool = True,
 ) -> tuple[str, folium.Map]:
     """
-    Build an interactive HTML map, save it, and bundle CDN assets locally.
+    Build an interactive HTML map, save it, bundle CDN assets and marker
+    images locally, and inject the live-reload snippet so an open browser
+    tab auto-refreshes when the file changes.
 
-    Parameters
-    ----------
-    area             : neighbourhood name shown on the origin marker
-    coords           : (lat, lon) of the search origin
-    results          : {category: DataFrame} from filter_nearby
-    output_path      : destination HTML file (directories created automatically)
-    tile_url         : custom tile URL for a local tile server, e.g.
-                       "http://localhost:8080/{z}/{x}/{y}.png"
-                       Leave None to use OpenStreetMap tiles (requires internet).
-    replace_existing : True  — clear previous markers; show only this turn's results.
-                       False — keep previous markers and append new ones.
-
-    Returns
-    -------
-    tuple[str, folium.Map]
-        (file:// URI of saved HTML file, the Folium map object)
+    Returns (file:// URI of the saved HTML, the Folium map object).
     """
     global _accumulated_layers
 
@@ -239,19 +345,20 @@ def generate_map(
     out.parent.mkdir(parents=True, exist_ok=True)
     m.save(str(out))
 
-    _localize_resources(out)
+    _localize_resources(out)   # download JS/CSS + marker images
+    _inject_live_reload(out)   # inject polling JS + bump version.txt
 
     abs_path = out.resolve()
     print(f"  [Map saved → {abs_path}]")
     return abs_path.as_uri(), m
 
 
-def clear_map(output_path: str = "map_output/map.html") -> None:
+def clear_map(output_path: str = "map_output/map.html") -> str:
     """
-    Overwrite the map with a blank world-view and reset accumulated markers.
+    Write a blank world-view map, reset accumulated markers, and bump
+    version.txt so an open browser tab reloads to the blank state.
 
-    Called on agent exit so stale session markers are not visible if the
-    map file is opened again after the program ends.
+    Returns the file:// URI of the cleared map file.
     """
     global _accumulated_layers
     _accumulated_layers = []
@@ -259,23 +366,42 @@ def clear_map(output_path: str = "map_output/map.html") -> None:
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     blank.save(str(out))
+    _localize_resources(out)
+    _inject_live_reload(out)
+    return out.resolve().as_uri()
+
+
+def open_map_in_browser(output_path: str = "map_output/map.html") -> None:
+    """
+    Open the map HTML in the system default browser via the local HTTP server.
+
+    Accepts either a plain file path or a file:// URI (as returned by
+    generate_map).  Subsequent generate_map calls bump version.txt and the
+    live-reload JS in the open tab auto-refreshes — no second call needed.
+    """
+    import webbrowser
+
+    clean = output_path.removeprefix("file://")
+    out = Path(clean).resolve()
+    port = _ensure_server(str(out.parent))
+    url = f"http://localhost:{port}/{out.name}"
+    webbrowser.open(url)
+    print(f"  [Map opened in browser → {url}]")
 
 
 def display_map_in_notebook(m: folium.Map, path: str | None = None) -> None:
     """
-    Render a Folium map inline inside a Jupyter / IPython notebook.
+    Render the map inline in a Jupyter notebook via the persistent HTTP server.
 
     VS Code's notebook CSP blocks Leaflet's CDN resources when the map is
-    embedded directly as HTML.  The workaround is to save the HTML file and
-    serve it from a local HTTP server, then display it in an IFrame pointing
-    to localhost — VS Code permits that origin.
+    embedded directly as HTML.  Serving via localhost avoids this restriction.
+    The persistent server (started once, reused every turn) means the IFrame
+    URL is stable and each new cell output fetches the latest saved map.html.
 
     Parameters
     ----------
-    m    : the Folium map object (used only when path is None and the file
-           needs to be (re)saved to the default location)
-    path : file:// URI or absolute path returned by generate_map.
-           When None, saves to map_output/map.html.
+    m    : Folium map object — used only when path is None (saves a fresh copy)
+    path : file:// URI returned by generate_map — preferred path; skips re-save
     """
     try:
         from IPython.display import IFrame, display
@@ -283,29 +409,14 @@ def display_map_in_notebook(m: folium.Map, path: str | None = None) -> None:
         print("IPython not available — open the map HTML in a browser.")
         return
 
-    import functools
-    import http.server
-    import socket
-    import threading
-
     if path is None:
         out = Path("map_output/map.html").resolve()
         out.parent.mkdir(parents=True, exist_ok=True)
         m.save(str(out))
         _localize_resources(out)
+        _inject_live_reload(out)
     else:
         out = Path(path.removeprefix("file://")).resolve()
 
-    # Spin up a local HTTP server so the browser can load static/ assets too
-    with socket.socket() as s:
-        s.bind(("", 0))
-        port = s.getsockname()[1]
-
-    handler = functools.partial(
-        http.server.SimpleHTTPRequestHandler,
-        directory=str(out.parent),
-    )
-    server = http.server.HTTPServer(("localhost", port), handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-
+    port = _ensure_server(str(out.parent))
     display(IFrame(f"http://localhost:{port}/{out.name}", width="100%", height=500))
